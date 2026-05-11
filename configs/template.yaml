@@ -1,0 +1,220 @@
+# ============================================================
+# DAPE Training Config
+# Two-stage: Stage 1 (Adjustable Norm-tuning) + Stage 2 (Visual Adapter)
+# ============================================================
+
+# --- Configurable Variables ---
+NumFrames: &NumFrames 17
+InputFPS: &InputFPS 6
+ResolutionH: &ResolutionH 512
+ResolutionW: &ResolutionW 512
+BaseLearningRate: &BaseLearningRate 5.0e-5
+CkptPath: &CkptPath models/tv2v-no2ndca-depthmidas.ckpt
+Stage2Steps: 70
+
+model:
+  base_learning_rate: *BaseLearningRate
+  target: dape.models.diffusion.VideoDiffusionEngineTV2V
+  params:
+    use_ema: False
+    scale_factor: 0.18215
+    disable_first_stage_autocast: True
+    log_keys:
+      - txt
+    ckpt_path: *CkptPath
+    freeze_model: normtuning
+
+    scheduler_config:
+      target: dape.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [100]
+        cycle_lengths: [10000000000000]
+        f_start: [1.e-6]
+        f_max: [1.]
+        f_min: [1.]
+
+    denoiser_config:
+      target: dape.modules.diffusionmodules.denoiser.DiscreteDenoiser
+      params:
+        num_idx: 1000
+        weighting_config:
+          target: dape.modules.diffusionmodules.denoiser_weighting.EpsWeighting
+        scaling_config:
+          target: dape.modules.diffusionmodules.denoiser_scaling.EpsScaling
+        discretization_config:
+          target: dape.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+
+    network_config:
+      target: dape.modules.diffusionmodules.controlmodel.ControlledUNetModel3DTV2V
+      params:
+        use_checkpoint: True
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [4, 2, 1]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 4]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        legacy: False
+        disable_temporal_text_ca: True
+        controlnet_config:
+          target: dape.modules.diffusionmodules.controlmodel.ControlNet2D
+          params:
+            use_checkpoint: True
+            in_channels: 4
+            hint_channels: 3
+            model_channels: 320
+            attention_resolutions: [4, 2, 1]
+            num_res_blocks: 2
+            channel_mult: [1, 2, 4, 4]
+            num_heads: 8
+            use_spatial_transformer: True
+            transformer_depth: 1
+            context_dim: 768
+            legacy: False
+            control_scales: 1.0
+
+    conditioner_config:
+      target: dape.modules.GeneralConditioner
+      params:
+        emb_models:
+          - is_trainable: False
+            input_key: txt
+            ucg_rate: 0.5
+            legacy_ucg_value: ""
+            target: dape.modules.encoders.modules.FrozenCLIPEmbedder
+            params:
+              freeze: true
+          - is_trainable: False
+            input_key: control_hint
+            ucg_rate: 0.1
+            target: dape.modules.encoders.modules.DepthMidasEncoder
+
+    first_stage_config:
+      target: dape.models.autoencoder.AutoencoderKLInferenceWrapper
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    loss_fn_config:
+      target: dape.modules.diffusionmodules.loss.StandardDiffusionLoss
+      params:
+        type: l2
+        sigma_sampler_config:
+          target: dape.modules.diffusionmodules.sigma_sampling.DiscreteSampling
+          params:
+            num_idx: 1000
+            discretization_config:
+              target: dape.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+        offset_noise_level: 0.1
+        offset_noise_varying_dim: 3
+
+    sampler_config:
+      target: dape.modules.diffusionmodules.sampling.EulerEDMSampler
+      params:
+        num_steps: 20
+        discretization_config:
+          target: dape.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+        guider_config:
+          target: dape.modules.diffusionmodules.guiders.VanillaCFGTV2V
+          params:
+            scale: 7.5
+
+data:
+  target: dape.data.detaset_webvid.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 4
+    wrap: False
+    train:
+      target: dape.data.webvid.webvid_dataset.SingleVideoDataset
+      params:
+        dataset_name: SingleVideo
+        data_dir: .
+        text_params:
+          input: text
+        video_params:
+          video_path: data/input_example.mp4
+          caption: "Snow-capped mountains under a clear blue sky, with clouds drifting past the peaks."
+          repeat: 1000
+          input_res_h: *ResolutionH
+          input_res_w: *ResolutionW
+          tsfm_params:
+            norm_mean: [0.5, 0.5, 0.5]
+            norm_std: [0.5, 0.5, 0.5]
+          num_frames: *NumFrames
+          frame_sample: sequential
+          loading: lax
+        first_stage_key: jpg
+        cond_stage_key: txt
+        use_control_hint: True
+
+lightning:
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 200
+      save_last: True
+      save_top_k: -1
+
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: True
+        batch_frequency: 1000
+        max_images: 8
+        log_images_kwargs:
+          use_ema_scope: False
+          N: 8
+          n_rows: *NumFrames
+          video_fps: *InputFPS
+
+  trainer:
+    precision: 16
+    devices: 1
+    benchmark: False
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
+    max_steps: 400
+    max_epochs: -1
+
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: True
+
+# ====== DAPE Inference ======
+inference:
+  video_path: data/input_example.mp4
+  num_keyframes: *NumFrames
+  H: *ResolutionH
+  W: *ResolutionW
+  original_fps: 18
+  target_fps: 6
+  num_samples: 1
+  batch_size: 1
+  sample_steps: 30
+  sampler_name: DPMPP2SAncestralSampler
+  cfg_scale: 7.5
+  save_path: outputs/dape_result
+  add_prompt: "masterpiece, high quality"
+  negative_prompt: "ugly, low quality"
+  seed: 42
+  prompt:
+    edit1: "Snow-capped mountains under a glowing purple aurora, clouds swirling like vibrant strokes in an impressionist painting."

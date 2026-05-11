@@ -1,0 +1,179 @@
+# ============================================================
+# DAPE Inference-Only Config
+# Run: python main.py -b configs/inference_only.yaml --train False
+# Loads pretrained ckpt and runs inference directly, no training.
+# ============================================================
+
+NumFrames: &NumFrames 17
+InputFPS: &InputFPS 6
+ResolutionH: &ResolutionH 512
+ResolutionW: &ResolutionW 512
+BaseLearningRate: &BaseLearningRate 5.0e-5
+CkptPath: &CkptPath models/tv2v-no2ndca-depthmidas.ckpt
+
+model:
+  base_learning_rate: *BaseLearningRate
+  target: dape.models.diffusion.VideoDiffusionEngineTV2V
+  params:
+    use_ema: False
+    scale_factor: 0.18215
+    disable_first_stage_autocast: True
+    log_keys:
+      - txt
+    ckpt_path: *CkptPath
+    freeze_model: spatial
+
+    denoiser_config:
+      target: dape.modules.diffusionmodules.denoiser.DiscreteDenoiser
+      params:
+        num_idx: 1000
+        weighting_config:
+          target: dape.modules.diffusionmodules.denoiser_weighting.EpsWeighting
+        scaling_config:
+          target: dape.modules.diffusionmodules.denoiser_scaling.EpsScaling
+        discretization_config:
+          target: dape.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+
+    network_config:
+      target: dape.modules.diffusionmodules.controlmodel.ControlledUNetModel3DTV2V
+      params:
+        use_checkpoint: False
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [4, 2, 1]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 4]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        legacy: False
+        disable_temporal_text_ca: True
+        controlnet_config:
+          target: dape.modules.diffusionmodules.controlmodel.ControlNet2D
+          params:
+            use_checkpoint: False
+            in_channels: 4
+            hint_channels: 3
+            model_channels: 320
+            attention_resolutions: [4, 2, 1]
+            num_res_blocks: 2
+            channel_mult: [1, 2, 4, 4]
+            num_heads: 8
+            use_spatial_transformer: True
+            transformer_depth: 1
+            context_dim: 768
+            legacy: False
+            control_scales: 1.0
+
+    conditioner_config:
+      target: dape.modules.GeneralConditioner
+      params:
+        emb_models:
+          - is_trainable: False
+            input_key: txt
+            ucg_rate: 0.0
+            legacy_ucg_value: ""
+            target: dape.modules.encoders.modules.FrozenCLIPEmbedder
+            params:
+              freeze: true
+          - is_trainable: False
+            input_key: control_hint
+            ucg_rate: 0.0
+            target: dape.modules.encoders.modules.DepthMidasEncoder
+
+    first_stage_config:
+      target: dape.models.autoencoder.AutoencoderKLInferenceWrapper
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    sampler_config:
+      target: dape.modules.diffusionmodules.sampling.EulerEDMSampler
+      params:
+        num_steps: 30
+        discretization_config:
+          target: dape.modules.diffusionmodules.discretizer.LegacyDDPMDiscretization
+        guider_config:
+          target: dape.modules.diffusionmodules.guiders.VanillaCFGTV2V
+          params:
+            scale: 7.5
+
+# Minimal data section — required by main.py but not used when --train False
+data:
+  target: dape.data.detaset_webvid.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 0
+    wrap: False
+    train:
+      target: dape.data.webvid.webvid_dataset.SingleVideoDataset
+      params:
+        dataset_name: SingleVideo
+        data_dir: .
+        text_params:
+          input: text
+        video_params:
+          video_path: data/input_example.mp4
+          caption: ""
+          repeat: 1
+          input_res_h: *ResolutionH
+          input_res_w: *ResolutionW
+          tsfm_params:
+            norm_mean: [0.5, 0.5, 0.5]
+            norm_std: [0.5, 0.5, 0.5]
+          num_frames: *NumFrames
+          frame_sample: sequential
+          loading: lax
+        first_stage_key: jpg
+        cond_stage_key: txt
+        use_control_hint: True
+
+lightning:
+  trainer:
+    precision: 16
+    devices: 1
+    benchmark: True
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
+    max_steps: 1
+    max_epochs: -1
+
+  strategy:
+    target: pytorch_lightning.strategies.DDPStrategy
+    params:
+      find_unused_parameters: True
+
+# ====== Inference (runs regardless of --train) ======
+inference:
+  video_path: data/input_example.mp4
+  num_keyframes: *NumFrames
+  H: *ResolutionH
+  W: *ResolutionW
+  original_fps: 18
+  target_fps: 6
+  num_samples: 1
+  batch_size: 1
+  sample_steps: 30
+  sampler_name: DPMPP2SAncestralSampler
+  cfg_scale: 7.5
+  save_path: outputs/inference_only
+  add_prompt: "masterpiece, high quality"
+  negative_prompt: "ugly, low quality"
+  seed: 42
+  prompt:
+    edit1: "Snow-capped mountains under a glowing purple aurora, clouds swirling like vibrant strokes in an impressionist painting."
